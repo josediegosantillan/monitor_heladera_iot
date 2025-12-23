@@ -1,0 +1,26 @@
+# Directorio de compilación de ESP-IDF
+build/
+
+# Archivos de configuración generados
+sdkconfig.old
+sdkconfig.defaults.old
+
+# Archivos de Python (usados por las herramientas de ESP-IDF)
+__pycache__/
+*.py[cod]
+*$py.class
+.espressif/
+
+# VS Code
+.vscode/ipch/
+.vscode/*.log
+# Opcional: Ignorar settings.json si contiene rutas locales específicas
+# .vscode/settings.json
+
+# Componentes gestionados (se descargan automáticamente)
+managed_components/
+dependencies.lock
+
+# Archivos temporales y del sistema
+.DS_Store
+Thumbs.db
