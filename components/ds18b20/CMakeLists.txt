@@ -1,4 +1,3 @@
-idf_component_register(SRCS "ds18b20.c"
+idf_component_register(SRCS "ds18b20.c" # Ej: ac_meter.c
                        INCLUDE_DIRS "include"
-                       REQUIRES driver esp_rom)
-                       
+                       REQUIRES esp_adc driver)   # Dependencias necesarias
