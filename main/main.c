@@ -31,19 +31,19 @@ static const char *TAG = "HELADERA_IOT";
 // Si no usaste el menuconfig, ajustá estos valores acá:
 
 // Sensores de Temperatura (GPIOs con salida, NO usar 34-39)
-#define PIN_TEMP_HELADERA   GPIO_NUM_32
-#define PIN_TEMP_TABLERO    GPIO_NUM_33
+#define PIN_TEMP_HELADERA   ((gpio_num_t)CONFIG_GPIO_SENSOR_HELADERA)
+#define PIN_TEMP_TABLERO    ((gpio_num_t)CONFIG_GPIO_SENSOR_TABLERO)
 
 // Sensores Eléctricos (ADC1)
 // Nota: En ESP32 Clásico:
 // GPIO 35 = ADC1_CHANNEL_7 (Sensor VP / ZMPT101B)
 // GPIO 34 = ADC1_CHANNEL_6 (Sensor VN / ZMCT103C)
 
-#define ADC_CHAN_VOLTAJE    ADC_CHANNEL_7  // GPIO 35
-#define ADC_CHAN_CORRIENTE  ADC_CHANNEL_6  // GPIO 34
+#define PIN_AC_VOLTAGE_GPIO ((gpio_num_t)CONFIG_GPIO_AC_VOLTAGE)
+#define PIN_AC_CURRENT_GPIO ((gpio_num_t)CONFIG_GPIO_AC_CURRENT)
 
 // Calibración Térmica
-#define TEMP_COEFF_PPM      100 // ppm/°C (Ajuste fino)
+#define TEMP_COEFF_PPM      CONFIG_TEMP_COEFF_PPM // ppm/°C (Ajuste fino)
 
 // ============================================================
 // 📊 ESTRUCTURA DE DATOS COMPARTIDA
@@ -97,9 +97,23 @@ void vTaskEnergia(void *pvParameters) {
     
     // 1. CREACIÓN DEL RECURSO ADC COMPARTIDO (Singleton)
     // --------------------------------------------------
+    adc_unit_t unit_v = ADC_UNIT_1;
+    adc_unit_t unit_i = ADC_UNIT_1;
+    adc_channel_t chan_v;
+    adc_channel_t chan_i;
+    esp_err_t err = adc_oneshot_io_to_channel(PIN_AC_VOLTAGE_GPIO, &unit_v, &chan_v);
+    if (err != ESP_OK || unit_v != ADC_UNIT_1) {
+        ESP_LOGE(TAG, "ADC GPIO voltage invalid: gpio=%d err=0x%x unit=%d", (int)PIN_AC_VOLTAGE_GPIO, (int)err, (int)unit_v);
+        vTaskDelete(NULL);
+    }
+    err = adc_oneshot_io_to_channel(PIN_AC_CURRENT_GPIO, &unit_i, &chan_i);
+    if (err != ESP_OK || unit_i != ADC_UNIT_1) {
+        ESP_LOGE(TAG, "ADC GPIO current invalid: gpio=%d err=0x%x unit=%d", (int)PIN_AC_CURRENT_GPIO, (int)err, (int)unit_i);
+        vTaskDelete(NULL);
+    }
     adc_oneshot_unit_handle_t adc_handle = NULL;
     adc_oneshot_unit_init_cfg_t init_config = {
-        .unit_id = ADC_UNIT_1, // ESP32 Clásico: GPIOs 32-39 están acá
+        .unit_id = unit_v, // ESP32 Clásico: GPIOs 32-39 están acá
         .ulp_mode = ADC_ULP_MODE_DISABLE,
     };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
@@ -108,7 +122,7 @@ void vTaskEnergia(void *pvParameters) {
     // 2. CONFIGURACIÓN SENSOR VOLTAJE (ZMPT101B)
     // --------------------------------------------------
     ac_meter_cfg_t cfg_v = {
-        .channel = ADC_CHAN_VOLTAJE, 
+        .channel = chan_v, 
         .atten = ADC_ATTEN_DB_11,     // <--- CORREGIDO: Máximo para ESP32 Clásico
         .bitwidth = ADC_BITWIDTH_DEFAULT,
         .fs_hz = 2000,                // 40 muestras por ciclo de 50Hz
@@ -121,7 +135,7 @@ void vTaskEnergia(void *pvParameters) {
     // --------------------------------------------------
     zmct103c_t zmct;
     zmct103c_cfg_t cfg_i = {
-        .adc_channel = ADC_CHAN_CORRIENTE,
+        .adc_channel = chan_i,
         .adc_atten = ADC_ATTEN_DB_11, // <--- CORREGIDO
         .burden_ohms = 68.0f,         // Resistencia de carga
         .ct_ratio = 1000.0f,          // Relación del trafo
@@ -138,8 +152,18 @@ void vTaskEnergia(void *pvParameters) {
         float temp_ref = 25.0f; // Temp de calibración laboratorio
 
         // A. Lectura Cruda
-        ac_meter_read(&lec_v);            // Lee voltaje
-        zmct103c_read_irms(&zmct, &lec_i);// Lee corriente
+        esp_err_t err_v = ac_meter_read(&lec_v);            // Lee voltaje
+        esp_err_t err_i = zmct103c_read_irms(&zmct, &lec_i);// Lee corriente
+        if (err_v != ESP_OK || err_i != ESP_OK) {
+            if (err_v != ESP_OK) {
+                ESP_LOGW(TAG, "AC voltage read failed: 0x%x", (int)err_v);
+            }
+            if (err_i != ESP_OK) {
+                ESP_LOGW(TAG, "AC current read failed: 0x%x", (int)err_i);
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
 
         // B. Obtener Temperatura del Tablero (para compensar)
         float temp_actual = 25.0f;
