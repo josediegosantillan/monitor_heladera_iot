@@ -14,9 +14,12 @@ menu "Configuracion de Hardware"
 
     config GPIO_AC_VOLTAGE
         int "GPIO Medicion Voltaje (ZMPT101B)"
-        default 36
+        default 35
         help
             Canal ADC para voltaje (SENSOR_VP). Ojo: Solo ADC1.
+            Ojo: Usar divisor de tensión para bajar 220V AC a rango 0-3.3V DC.
+            Conectar con capacitor de 100nF en paralelo para filtrar ruido.(0,1uF, rx7)
+            Conectar a 5v 
 
     config GPIO_AC_CURRENT
         int "GPIO Medicion Corriente (ZMCT103C)"
