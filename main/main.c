@@ -44,6 +44,9 @@ static const char *TAG = "HELADERA_IOT";
 
 // Calibración Térmica
 #define TEMP_COEFF_PPM      CONFIG_TEMP_COEFF_PPM // ppm/°C (Ajuste fino)
+#define TEMP_COEFF_PPM_I    120 // ppm/��C (Ajuste fino corriente)
+#define CURRENT_CAL_FACTOR  0.41f
+#define CURRENT_EMA_ALPHA   0.20f
 
 // ============================================================
 // 📊 ESTRUCTURA DE DATOS COMPARTIDA
@@ -69,6 +72,7 @@ void vTaskTermica(void *pvParameters) {
     // Inicializamos sensores
     ds18b20_init(&s_heladera, PIN_TEMP_HELADERA);
     ds18b20_init(&s_tablero, PIN_TEMP_TABLERO);
+    
 
     ESP_LOGI(TAG, "🌡️ Servicio de Temperatura iniciado");
 
@@ -94,6 +98,7 @@ void vTaskTermica(void *pvParameters) {
 // ⚡ TAREA 2: METROLOGÍA (AC Voltaje + Corriente)
 // ============================================================
 void vTaskEnergia(void *pvParameters) {
+    float i_ema = 0.0f;
     
     // 1. CREACIÓN DEL RECURSO ADC COMPARTIDO (Singleton)
     // --------------------------------------------------
@@ -179,20 +184,30 @@ void vTaskEnergia(void *pvParameters) {
         // Si hace calor, la resistencia sube -> V medido cae -> Factor > 1 sube el resultado.
         float delta_t = temp_actual - temp_ref;
         float factor_corr = 1.0f + ((float)TEMP_COEFF_PPM / 1000000.0f) * delta_t;
+        float factor_corr_i = 1.0f + ((float)TEMP_COEFF_PPM_I / 1000000.0f) * delta_t;
         
-        // Aplicamos corrección
+        // Aplicamos correcci�n
         float v_final = lec_v.vline_rms * factor_corr;
+        float i_final = lec_i * factor_corr_i;
+        i_final *= CURRENT_CAL_FACTOR;
+        if (i_ema == 0.0f) {
+            i_ema = i_final;
+        } else {
+            i_ema = (CURRENT_EMA_ALPHA * i_final) + ((1.0f - CURRENT_EMA_ALPHA) * i_ema);
+        }
+        i_final = i_ema;
+        if (i_final < 0.0f) i_final = 0.0f;
 
         // D. Zona Muerta (Noise Gate) - "El Fantasma de los 2.5V"
         // Si hay menos de 9V (ruido), forzamos a 0.
         if (v_final < 9.0f) v_final = 0.0f;
-        if (lec_i < 0.05f) lec_i = 0.0f;    // Menos de 50mA es ruido
+        if (i_final < 0.05f) i_final = 0.0f;    // Menos de 50mA es ruido
 
         // E. Actualizar Estado Global
         if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             g_estado.voltaje_rms = v_final;
-            g_estado.corriente_rms = lec_i;
-            g_estado.potencia_aparente = v_final * lec_i;
+            g_estado.corriente_rms = i_final;
+            g_estado.potencia_aparente = v_final * i_final;
             xSemaphoreGive(g_mutex);
         }
 
