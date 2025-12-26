@@ -16,22 +16,56 @@ menu "Configuracion de Hardware"
         int "GPIO Medicion Voltaje (ZMPT101B)"
         default 35
         help
-            Canal ADC para voltaje (SENSOR_VP). Ojo: Solo ADC1.
+            Canal ADC para voltaje (SENSOR_VP).
+            Ojo: Solo ADC1.
             Ojo: Usar divisor de tensión para bajar 220V AC a rango 0-3.3V DC.
-            Conectar con capacitor de 100nF en paralelo para filtrar ruido.(0,1uF, rx7)
-            Conectar a 5v 
+            Conectar con capacitor de 100nF en paralelo para filtrar ruido.
+            Conectar a 5v.
 
     config GPIO_AC_CURRENT
         int "GPIO Medicion Corriente (ZMCT103C)"
         default 34
         help
-            Canal ADC para corriente (SENSOR_VN). Ojo: Solo ADC1.
+            Canal ADC para corriente (SENSOR_VN).
+            Ojo: Solo ADC1.
 
     config TEMP_COEFF_PPM
         int "Coeficiente de Correccion (ppm/C)"
         default 100
         help
-            Ajuste por deriva térmica de los componentes. 
+            Ajuste por deriva térmica de los componentes.
             Ej: Resistencias metal film suelen ser 50-100 ppm.
+
+endmenu
+
+menu "Configuracion de Proteccion"
+
+    config GPIO_RELAY
+        int "GPIO Rele de Corte"
+        default 26
+        help
+            Pin que comanda la base del transistor del rele (2N2222).
+            Lógica Positiva: 1 = Relé ON (Cerrado), 0 = Relé OFF (Abierto).
+
+    config VOLT_LOW_LIMIT
+        int "Corte por Baja Tension (V)"
+        default 190
+        help
+            Si la tensión baja de este valor, se corta el suministro.
+            Valor típico protección heladeras: 190V - 195V.
+
+    config VOLT_HIGH_LIMIT
+        int "Corte por Alta Tension (V)"
+        default 245
+        help
+            Si la tensión sube de este valor, se corta el suministro.
+            Valor típico protección heladeras: 240V - 245V.
+
+    config RECONNECT_DELAY_S
+        int "Tiempo de Reconexion (segundos)"
+        default 180
+        help
+            Tiempo de espera obligatorio después de un corte para ecualizar presiones.
+            Valor recomendado: 180 segundos (3 minutos).
 
 endmenu
