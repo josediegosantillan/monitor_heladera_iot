@@ -6,8 +6,10 @@ extern "C" {
 #endif
 
 /**
- * @brief Inicia la gestión de WiFi.
- * Intenta conectar a la red guardada. Si falla, levanta un AP + WebServer.
+ * @brief Inicia la gestión de conectividad.
+ * - Gestiona conexión STA (Cliente).
+ * - Si falla, levanta AP + Portal Cautivo.
+ * - Incluye servidor DNS para Captive Portal (Pop-up automático).
  */
 void wifi_portal_init(void);
 
