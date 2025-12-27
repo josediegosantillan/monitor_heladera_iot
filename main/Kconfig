@@ -68,4 +68,18 @@ menu "Configuracion de Proteccion"
             Tiempo de espera obligatorio después de un corte para ecualizar presiones.
             Valor recomendado: 180 segundos (3 minutos).
 
+    config VOLT_HYSTERESIS_V
+        int "Histeresis de Reconexion (V)"
+        default 5
+        help
+            Margen para evitar reconexion inmediata por fluctuaciones.
+            Se aplica al reenganche: min = baja + histeresis, max = alta - histeresis.
+
+    config RECONNECT_STABLE_S
+        int "Ventana de Voltaje Estable (segundos)"
+        default 5
+        help
+            Tiempo continuo dentro del rango para permitir reconexion.
+            Ayuda a evitar reconexiones con red inestable.
+
 endmenu

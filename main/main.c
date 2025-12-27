@@ -45,6 +45,12 @@ static const char *TAG = "HELADERA_MAIN";
 #define CURRENT_CAL_FACTOR  0.41f
 #define CURRENT_EMA_ALPHA   0.20f
 
+// --- PARAMETROS DE PROTECCION ---
+#define VOLT_LOW_LIMIT_V    ((float)CONFIG_VOLT_LOW_LIMIT)
+#define VOLT_HIGH_LIMIT_V   ((float)CONFIG_VOLT_HIGH_LIMIT)
+#define VOLT_HYSTERESIS_V   ((float)CONFIG_VOLT_HYSTERESIS_V)
+#define RECONNECT_STABLE_TICKS pdMS_TO_TICKS(CONFIG_RECONNECT_STABLE_S * 1000)
+
 // --- SENTINELS (Valores de error) ---
 #define TEMP_INVALID_SENTINEL -999.0f
 #define ENERGY_INVALID_SENTINEL -1.0f
@@ -257,6 +263,91 @@ void vTaskReporte(void *pvParameters) {
 }
 
 // ---------------------------------------------------------------------
+// TAREA 5: Proteccion por Tension (Corte y Reconexion)
+// ---------------------------------------------------------------------
+void vTaskProteccion(void *pvParameters) {
+    const TickType_t check_delay = pdMS_TO_TICKS(200);
+    const TickType_t reconnect_delay = pdMS_TO_TICKS(CONFIG_RECONNECT_DELAY_S * 1000);
+    const TickType_t stable_window = RECONNECT_STABLE_TICKS;
+    bool cut_active = false;
+    bool stable_timing = false;
+    TickType_t last_cut = 0;
+    TickType_t stable_start = 0;
+
+    while (1) {
+        float v = ENERGY_INVALID_SENTINEL;
+        bool relay_state = false;
+
+        if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            v = g_estado.voltaje_rms;
+            relay_state = g_estado.rele_estado;
+            xSemaphoreGive(g_mutex);
+        }
+
+        bool v_valid = (v != ENERGY_INVALID_SENTINEL) && (v > 1.0f);
+        bool must_cut = (!v_valid) || (v < VOLT_LOW_LIMIT_V) || (v > VOLT_HIGH_LIMIT_V);
+
+        if (must_cut) {
+            TickType_t now = xTaskGetTickCount();
+            if (!cut_active) {
+                last_cut = now;
+            }
+            cut_active = true;
+            stable_timing = false;
+
+            if (relay_state) {
+                relay_off(&g_relay_handle);
+                if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    g_estado.rele_estado = false;
+                    xSemaphoreGive(g_mutex);
+                }
+                ESP_LOGW(TAG, "Corte por tension fuera de rango: %.1fV", v);
+            }
+        } else {
+            float low_reconnect = VOLT_LOW_LIMIT_V + VOLT_HYSTERESIS_V;
+            float high_reconnect = VOLT_HIGH_LIMIT_V - VOLT_HYSTERESIS_V;
+            if (low_reconnect >= high_reconnect) {
+                low_reconnect = VOLT_LOW_LIMIT_V;
+                high_reconnect = VOLT_HIGH_LIMIT_V;
+            }
+            bool in_reconnect_band = (v >= low_reconnect) && (v <= high_reconnect);
+
+            if (cut_active) {
+                TickType_t now = xTaskGetTickCount();
+                if (in_reconnect_band) {
+                    if (!stable_timing) {
+                        stable_start = now;
+                        stable_timing = true;
+                    }
+                    if ((now - last_cut) >= reconnect_delay && (now - stable_start) >= stable_window) {
+                        relay_on(&g_relay_handle);
+                        cut_active = false;
+                        stable_timing = false;
+                        if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                            g_estado.rele_estado = true;
+                            xSemaphoreGive(g_mutex);
+                        }
+                        ESP_LOGI(TAG, "Reconexion habilitada. Voltaje: %.1fV", v);
+                    }
+                } else {
+                    stable_timing = false;
+                }
+            } else if (!relay_state) {
+                relay_on(&g_relay_handle);
+                if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                    g_estado.rele_estado = true;
+                    xSemaphoreGive(g_mutex);
+                }
+                ESP_LOGI(TAG, "Rele habilitado. Voltaje: %.1fV", v);
+            }
+        }
+
+        vTaskDelay(check_delay);
+    }
+}
+
+
+// ---------------------------------------------------------------------
 // MAIN APPLICATION
 // ---------------------------------------------------------------------
 void app_main(void) {
@@ -327,6 +418,7 @@ void app_main(void) {
     xTaskCreate(vTaskFactoryReset, "Task_Reset", 2048, NULL, 1, NULL);
     xTaskCreatePinnedToCore(vTaskTermica, "Task_Clima", 4096, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(vTaskEnergia, "Task_Metrologia", 4096, NULL, 10, NULL, 1);
+    xTaskCreatePinnedToCore(vTaskProteccion, "Task_Proteccion", 4096, NULL, 8, NULL, 1);
     xTaskCreatePinnedToCore(vTaskReporte, "Task_Reporte", 4096, NULL, 1, NULL, 0);
 
     ESP_LOGI(TAG, "=== SISTEMA ARRANCADO Y OPERATIVO ===");
