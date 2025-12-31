@@ -13,6 +13,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "driver/gpio.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
@@ -27,6 +28,7 @@
 #include "wifi_portal.h"
 #include "mqtt_connector.h"
 #include "sdkconfig.h"
+#include "cJSON.h"
 
 static const char *TAG = "HELADERA_MAIN";
 
@@ -63,12 +65,96 @@ typedef struct {
     float corriente_rms;    
     float potencia_aparente;
     bool  rele_estado;      
+    int   t_restante_s;
 } sistema_estado_t;
 
 // Variables Globales Protegidas
 static sistema_estado_t g_estado;
 static SemaphoreHandle_t g_mutex;
 static relay_handle_t g_relay_handle; 
+
+// --- CONFIG REMOTA (NVS) ---
+typedef struct {
+    int vmin;
+    int vmax;
+    int delay_s;
+} heladera_cfg_t;
+
+static heladera_cfg_t g_cfg;
+
+static void cfg_load_defaults(heladera_cfg_t *cfg) {
+    cfg->vmin = CONFIG_VOLT_LOW_LIMIT;
+    cfg->vmax = CONFIG_VOLT_HIGH_LIMIT;
+    cfg->delay_s = CONFIG_RECONNECT_DELAY_S;
+}
+
+static void cfg_load_nvs(heladera_cfg_t *cfg) {
+    nvs_handle_t h;
+    if (nvs_open("heladera_cfg", NVS_READONLY, &h) == ESP_OK) {
+        int32_t v = 0;
+        if (nvs_get_i32(h, "vmin", &v) == ESP_OK) cfg->vmin = (int)v;
+        if (nvs_get_i32(h, "vmax", &v) == ESP_OK) cfg->vmax = (int)v;
+        if (nvs_get_i32(h, "delay_s", &v) == ESP_OK) cfg->delay_s = (int)v;
+        nvs_close(h);
+    }
+}
+
+static void cfg_save_nvs(const heladera_cfg_t *cfg) {
+    nvs_handle_t h;
+    if (nvs_open("heladera_cfg", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, "vmin", cfg->vmin);
+        nvs_set_i32(h, "vmax", cfg->vmax);
+        nvs_set_i32(h, "delay_s", cfg->delay_s);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void mqtt_on_message(const char *topic, int topic_len,
+                            const char *data, int data_len) {
+    const char *cfg_topic = MQTT_TOPIC_CONFIG;
+    size_t cfg_len = strlen(cfg_topic);
+
+    if (!topic || !data || topic_len != (int)cfg_len ||
+        strncmp(topic, cfg_topic, cfg_len) != 0) {
+        return;
+    }
+
+    if (data_len <= 0 || data_len >= 128) return;
+
+    char buf[128];
+    memcpy(buf, data, data_len);
+    buf[data_len] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    if (!root) return;
+
+    cJSON *vmin = cJSON_GetObjectItem(root, "vmin");
+    cJSON *vmax = cJSON_GetObjectItem(root, "vmax");
+    cJSON *delay = cJSON_GetObjectItem(root, "delay_s");
+    if (!delay) delay = cJSON_GetObjectItem(root, "delay");
+
+    if (cJSON_IsNumber(vmin) && cJSON_IsNumber(vmax) && cJSON_IsNumber(delay)) {
+        int nvmin = (int)vmin->valuedouble;
+        int nvmax = (int)vmax->valuedouble;
+        int ndelay = (int)delay->valuedouble;
+
+        if (nvmin > 0 && nvmax > 0 && ndelay > 0 && nvmin < nvmax) {
+            heladera_cfg_t next = { .vmin = nvmin, .vmax = nvmax, .delay_s = ndelay };
+            bool applied = false;
+
+            if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                g_cfg = next;
+                xSemaphoreGive(g_mutex);
+                applied = true;
+            }
+            if (applied) {
+                cfg_save_nvs(&next);
+            }
+        }
+    }
+    cJSON_Delete(root);
+}
 
 // ---------------------------------------------------------------------
 // TAREA 1: Factory Reset (Seguridad Física)
@@ -221,7 +307,7 @@ void vTaskEnergia(void *pvParameters) {
 // TAREA 4: Reporte y Telemetría MQTT
 // ---------------------------------------------------------------------
 void vTaskReporte(void *pvParameters) {
-    char json_payload[200];
+    char json_payload[240];
     
     vTaskDelay(pdMS_TO_TICKS(5000));
     
@@ -243,13 +329,14 @@ void vTaskReporte(void *pvParameters) {
             // Envío MQTT
             if (mqtt_app_is_connected()) {
                 snprintf(json_payload, sizeof(json_payload), 
-                        "{\"temp_heladera\": %.2f, \"temp_tablero\": %.2f, \"voltaje\": %.1f, \"corriente\": %.2f, \"potencia\": %.1f, \"rele\": %s}",
+                        "{\"temp_heladera\": %.2f, \"temp_tablero\": %.2f, \"voltaje\": %.1f, \"corriente\": %.2f, \"potencia\": %.1f, \"rele\": %s, \"t_restante\": %d}",
                         (snapshot.temp_heladera == TEMP_INVALID_SENTINEL) ? 0.0 : snapshot.temp_heladera,
                         (snapshot.temp_tablero == TEMP_INVALID_SENTINEL) ? 0.0 : snapshot.temp_tablero,
                         (snapshot.voltaje_rms == ENERGY_INVALID_SENTINEL) ? 0.0 : snapshot.voltaje_rms,
                         (snapshot.corriente_rms == ENERGY_INVALID_SENTINEL) ? 0.0 : snapshot.corriente_rms,
                         snapshot.potencia_aparente,
-                        snapshot.rele_estado ? "true" : "false");
+                        snapshot.rele_estado ? "true" : "false",
+                        snapshot.t_restante_s);
 
                 mqtt_app_publish(MQTT_TOPIC_TELEMETRY, json_payload);
                 ESP_LOGI(TAG, "📡 MQTT Enviado: %s", json_payload);
@@ -267,7 +354,6 @@ void vTaskReporte(void *pvParameters) {
 // ---------------------------------------------------------------------
 void vTaskProteccion(void *pvParameters) {
     const TickType_t check_delay = pdMS_TO_TICKS(200);
-    const TickType_t reconnect_delay = pdMS_TO_TICKS(CONFIG_RECONNECT_DELAY_S * 1000);
     const TickType_t stable_window = RECONNECT_STABLE_TICKS;
     bool cut_active = true; // Treat power-up as a cut; wait after voltage returns
     bool stable_timing = false;
@@ -278,15 +364,35 @@ void vTaskProteccion(void *pvParameters) {
     while (1) {
         float v = ENERGY_INVALID_SENTINEL;
         bool relay_state = false;
+        int t_restante_s = 0;
+
+        heladera_cfg_t cfg = {
+            .vmin = CONFIG_VOLT_LOW_LIMIT,
+            .vmax = CONFIG_VOLT_HIGH_LIMIT,
+            .delay_s = CONFIG_RECONNECT_DELAY_S
+        };
 
         if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             v = g_estado.voltaje_rms;
             relay_state = g_estado.rele_estado;
+            cfg = g_cfg;
             xSemaphoreGive(g_mutex);
         }
 
+        if (cfg.vmin <= 0 || cfg.vmax <= 0 || cfg.vmin >= cfg.vmax) {
+            cfg.vmin = CONFIG_VOLT_LOW_LIMIT;
+            cfg.vmax = CONFIG_VOLT_HIGH_LIMIT;
+        }
+        if (cfg.delay_s <= 0) {
+            cfg.delay_s = CONFIG_RECONNECT_DELAY_S;
+        }
+
+        float low_limit = (float)cfg.vmin;
+        float high_limit = (float)cfg.vmax;
+        TickType_t reconnect_delay = pdMS_TO_TICKS((uint32_t)cfg.delay_s * 1000U);
+
         bool v_valid = (v != ENERGY_INVALID_SENTINEL) && (v > 1.0f);
-        bool must_cut = (!v_valid) || (v < VOLT_LOW_LIMIT_V) || (v > VOLT_HIGH_LIMIT_V);
+        bool must_cut = (!v_valid) || (v < low_limit) || (v > high_limit);
 
         if (must_cut) {
             cut_active = true;
@@ -302,11 +408,11 @@ void vTaskProteccion(void *pvParameters) {
                 ESP_LOGW(TAG, "Corte por tension fuera de rango: %.1fV", v);
             }
         } else {
-            float low_reconnect = VOLT_LOW_LIMIT_V + VOLT_HYSTERESIS_V;
-            float high_reconnect = VOLT_HIGH_LIMIT_V - VOLT_HYSTERESIS_V;
+            float low_reconnect = low_limit + VOLT_HYSTERESIS_V;
+            float high_reconnect = high_limit - VOLT_HYSTERESIS_V;
             if (low_reconnect >= high_reconnect) {
-                low_reconnect = VOLT_LOW_LIMIT_V;
-                high_reconnect = VOLT_HIGH_LIMIT_V;
+                low_reconnect = low_limit;
+                high_reconnect = high_limit;
             }
             bool in_reconnect_band = (v >= low_reconnect) && (v <= high_reconnect);
 
@@ -320,6 +426,15 @@ void vTaskProteccion(void *pvParameters) {
                     if (!stable_timing) {
                         stable_start = now;
                         stable_timing = true;
+                    }
+                    TickType_t elapsed_delay = now - reconnect_start;
+                    TickType_t elapsed_stable = now - stable_start;
+                    TickType_t rem_delay = (elapsed_delay >= reconnect_delay) ? 0 : (reconnect_delay - elapsed_delay);
+                    TickType_t rem_stable = (elapsed_stable >= stable_window) ? 0 : (stable_window - elapsed_stable);
+                    TickType_t rem = (rem_delay > rem_stable) ? rem_delay : rem_stable;
+                    if (rem > 0) {
+                        uint32_t rem_ms = (uint32_t)pdTICKS_TO_MS(rem);
+                        t_restante_s = (int)((rem_ms + 999U) / 1000U);
                     }
                     if ((now - reconnect_start) >= reconnect_delay && (now - stable_start) >= stable_window) {
                         relay_on(&g_relay_handle);
@@ -346,6 +461,10 @@ void vTaskProteccion(void *pvParameters) {
             }
         }
 
+        if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            g_estado.t_restante_s = t_restante_s;
+            xSemaphoreGive(g_mutex);
+        }
         vTaskDelay(check_delay);
     }
 }
@@ -375,6 +494,10 @@ void app_main(void) {
     g_estado.temp_tablero = TEMP_INVALID_SENTINEL;
     g_estado.voltaje_rms = ENERGY_INVALID_SENTINEL;
     g_estado.rele_estado = false;
+    g_estado.t_restante_s = 0;
+
+    cfg_load_defaults(&g_cfg);
+    cfg_load_nvs(&g_cfg);
 
     // 4. Inicializar Hardware
     ESP_LOGI(TAG, "Iniciando Hardware...");
@@ -416,6 +539,8 @@ void app_main(void) {
 
     // 6. Iniciar MQTT (Ahora seguro porque tenemos red)
     ESP_LOGI(TAG, "Iniciando Stack MQTT...");
+    mqtt_app_set_rx_callback(mqtt_on_message);
+
     mqtt_app_start();
 
     // 7. Lanzar Tareas

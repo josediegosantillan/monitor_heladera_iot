@@ -21,6 +21,7 @@ static _Atomic esp_mqtt_client_handle_t g_client = ATOMIC_VAR_INIT(NULL);
 
 // Estado de conexión (Atómico para thread-safety)
 static atomic_bool is_connected = ATOMIC_VAR_INIT(false);
+static mqtt_rx_cb_t s_rx_cb = NULL;
 
 /**
  * @brief Manejador de eventos MQTT
@@ -48,11 +49,18 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         // Publicar mensaje de nacimiento
         // Nota: Para suscripciones críticas, mover a MQTT_EVENT_SUBSCRIBED
         esp_mqtt_client_publish(event_client, MQTT_TOPIC_STATUS, "ONLINE", 0, 1, 1);
+        esp_mqtt_client_subscribe(event_client, MQTT_TOPIC_CONFIG, 1);
         break;
 
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "⚠️ MQTT Desconectado");
         atomic_store(&is_connected, false);
+        break;
+
+    case MQTT_EVENT_DATA:
+        if (s_rx_cb && event->topic && event->data) {
+            s_rx_cb(event->topic, event->topic_len, event->data, event->data_len);
+        }
         break;
 
     case MQTT_EVENT_ERROR:
@@ -71,6 +79,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     default:
         break;
     }
+}
+
+void mqtt_app_set_rx_callback(mqtt_rx_cb_t cb) {
+    s_rx_cb = cb;
 }
 
 void mqtt_app_start(void) {
@@ -103,8 +115,14 @@ void mqtt_app_start(void) {
             },
         },
         .session = {
-            .keepalive = 60,
+            .keepalive = 30,
             .protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+            .last_will = {
+                .topic = MQTT_TOPIC_STATUS,
+                .msg = "OFFLINE",
+                .qos = 1,
+                .retain = 1,
+            },
             // Deshabilitar autoreconnect automático si queremos controlarlo manualmente
             // .disable_auto_reconnect = false (default)
         },
