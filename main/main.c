@@ -269,9 +269,10 @@ void vTaskProteccion(void *pvParameters) {
     const TickType_t check_delay = pdMS_TO_TICKS(200);
     const TickType_t reconnect_delay = pdMS_TO_TICKS(CONFIG_RECONNECT_DELAY_S * 1000);
     const TickType_t stable_window = RECONNECT_STABLE_TICKS;
-    bool cut_active = false;
+    bool cut_active = true; // Treat power-up as a cut; wait after voltage returns
     bool stable_timing = false;
-    TickType_t last_cut = 0;
+    bool delay_timing = false;
+    TickType_t reconnect_start = 0;
     TickType_t stable_start = 0;
 
     while (1) {
@@ -288,11 +289,8 @@ void vTaskProteccion(void *pvParameters) {
         bool must_cut = (!v_valid) || (v < VOLT_LOW_LIMIT_V) || (v > VOLT_HIGH_LIMIT_V);
 
         if (must_cut) {
-            TickType_t now = xTaskGetTickCount();
-            if (!cut_active) {
-                last_cut = now;
-            }
             cut_active = true;
+            delay_timing = false;
             stable_timing = false;
 
             if (relay_state) {
@@ -315,13 +313,18 @@ void vTaskProteccion(void *pvParameters) {
             if (cut_active) {
                 TickType_t now = xTaskGetTickCount();
                 if (in_reconnect_band) {
+                    if (!delay_timing) {
+                        reconnect_start = now;
+                        delay_timing = true;
+                    }
                     if (!stable_timing) {
                         stable_start = now;
                         stable_timing = true;
                     }
-                    if ((now - last_cut) >= reconnect_delay && (now - stable_start) >= stable_window) {
+                    if ((now - reconnect_start) >= reconnect_delay && (now - stable_start) >= stable_window) {
                         relay_on(&g_relay_handle);
                         cut_active = false;
+                        delay_timing = false;
                         stable_timing = false;
                         if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                             g_estado.rele_estado = true;
@@ -330,6 +333,7 @@ void vTaskProteccion(void *pvParameters) {
                         ESP_LOGI(TAG, "Reconexion habilitada. Voltaje: %.1fV", v);
                     }
                 } else {
+                    delay_timing = false;
                     stable_timing = false;
                 }
             } else if (!relay_state) {

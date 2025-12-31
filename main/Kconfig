@@ -18,7 +18,7 @@ menu "Configuracion de Hardware"
         help
             Canal ADC para voltaje (SENSOR_VP).
             Ojo: Solo ADC1.
-            Ojo: Usar divisor de tensión para bajar 220V AC a rango 0-3.3V DC.
+            
             Conectar con capacitor de 100nF en paralelo para filtrar ruido.
             Conectar a 5v.
 
@@ -42,7 +42,7 @@ menu "Configuracion de Proteccion"
 
     config GPIO_RELAY
         int "GPIO Rele de Corte"
-        default 26
+        default 23
         help
             Pin que comanda la base del transistor del rele (2N2222).
             Lógica Positiva: 1 = Relé ON (Cerrado), 0 = Relé OFF (Abierto).
