@@ -2,12 +2,14 @@
  * @file main.c
  * @brief Controlador Heladera IoT - Arquitectura Hub & Spoke
  * @author Arq. Gadd / Diego
- * @version 3.0 (Producción: WiFi Wait + WSS + Relay + Sensors)
+ * @version 3.2 (Producción: LCD I2C Fix Buffer + NTP + Protecciones)
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -18,6 +20,7 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_netif_types.h"
+#include "esp_sntp.h"
 
 // --- DRIVERS Y COMPONENTES PROPIOS ---
 #include "esp_adc/adc_oneshot.h"
@@ -27,6 +30,7 @@
 #include "relay_driver.h"
 #include "wifi_portal.h"
 #include "mqtt_connector.h"
+#include "i2c_lcd.h"  // Driver del LCD
 #include "sdkconfig.h"
 #include "cJSON.h"
 
@@ -38,7 +42,6 @@ static const char *TAG = "HELADERA_MAIN";
 #define PIN_TEMP_TABLERO    ((gpio_num_t)CONFIG_GPIO_SENSOR_TABLERO)
 #define PIN_AC_VOLTAGE_GPIO ((gpio_num_t)CONFIG_GPIO_AC_VOLTAGE)
 #define PIN_AC_CURRENT_GPIO ((gpio_num_t)CONFIG_GPIO_AC_CURRENT)
-// FIX: Nombre correcto de la variable Kconfig
 #define PIN_RELE_MAIN       ((gpio_num_t)CONFIG_GPIO_RELAY)
 
 // --- PARAMETROS DE CALIBRACION ---
@@ -157,6 +160,20 @@ static void mqtt_on_message(const char *topic, int topic_len,
 }
 
 // ---------------------------------------------------------------------
+// CONFIGURACION HORARIA (SNTP)
+// ---------------------------------------------------------------------
+static void init_sntp(void) {
+    ESP_LOGI(TAG, "Inicializando SNTP para obtener hora...");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+
+    // Configurar Timezone para Buenos Aires (UTC-3)
+    setenv("TZ", "ART3", 1);
+    tzset();
+}
+
+// ---------------------------------------------------------------------
 // TAREA 1: Factory Reset (Seguridad Física)
 // ---------------------------------------------------------------------
 void vTaskFactoryReset(void *pvParameters) {
@@ -246,12 +263,10 @@ void vTaskEnergia(void *pvParameters) {
     adc_oneshot_unit_init_cfg_t init_config = { .unit_id = unit_v, .ulp_mode = ADC_ULP_MODE_DISABLE };
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc_handle));
 
-    // FIX: Actualizado a ADC_ATTEN_DB_12 para ESP-IDF v5.x
     ac_meter_cfg_t cfg_v = { .channel = chan_v, .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT, .fs_hz = 2000, .window_ms = 200 };
     ESP_ERROR_CHECK(ac_meter_init(adc_handle, &cfg_v));
 
     zmct103c_t zmct;
-    // FIX: Actualizado a ADC_ATTEN_DB_12
     zmct103c_cfg_t cfg_i = { .adc_channel = chan_i, .adc_atten = ADC_ATTEN_DB_12, .burden_ohms = 68.0f, .ct_ratio = 1000.0f, .sample_rate_hz = 2000, .cycles = 10, .multisample = 4 };
     ESP_ERROR_CHECK(zmct103c_init(&zmct, adc_handle, &cfg_i));
 
@@ -355,7 +370,7 @@ void vTaskReporte(void *pvParameters) {
 void vTaskProteccion(void *pvParameters) {
     const TickType_t check_delay = pdMS_TO_TICKS(200);
     const TickType_t stable_window = RECONNECT_STABLE_TICKS;
-    bool cut_active = true; // Treat power-up as a cut; wait after voltage returns
+    bool cut_active = true; 
     bool stable_timing = false;
     bool delay_timing = false;
     TickType_t reconnect_start = 0;
@@ -469,6 +484,68 @@ void vTaskProteccion(void *pvParameters) {
     }
 }
 
+// ---------------------------------------------------------------------
+// TAREA 6: Display LCD (Interfaz Local) - CORREGIDO
+// ---------------------------------------------------------------------
+void vTaskDisplay(void *pvParameters) {
+    // AUMENTAMOS EL BUFFER: De 17 a 64 bytes para evitar errores de truncado
+    char linea_buff[64]; 
+    
+    // Inicializar LCD
+    lcd_init();
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_send_string("Iniciando...");
+
+    while (1) {
+        sistema_estado_t snapshot;
+        bool data_valid = false;
+        
+        // 1. Leer Datos Globales (Thread Safe)
+        if (xSemaphoreTake(g_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            snapshot = g_estado;
+            data_valid = true;
+            xSemaphoreGive(g_mutex);
+        }
+
+        // 2. Obtener Hora Actual
+        time_t now;
+        struct tm timeinfo;
+        time(&now);
+        localtime_r(&now, &timeinfo);
+        bool time_synced = (timeinfo.tm_year > (2020 - 1900));
+
+        if (data_valid) {
+            // --- RENGLON 1: Hora y Temp ---
+            lcd_set_cursor(0, 0);
+            if (time_synced) {
+                snprintf(linea_buff, sizeof(linea_buff), "%02d:%02d T:%.1f\xDF", 
+                         timeinfo.tm_hour, timeinfo.tm_min, 
+                         (snapshot.temp_heladera == TEMP_INVALID_SENTINEL) ? 0.0 : snapshot.temp_heladera);
+            } else {
+                snprintf(linea_buff, sizeof(linea_buff), "--:-- T:%.1f\xDF", 
+                         (snapshot.temp_heladera == TEMP_INVALID_SENTINEL) ? 0.0 : snapshot.temp_heladera);
+            }
+            lcd_send_string(linea_buff);
+
+            // --- RENGLON 2: Voltaje y Estado ---
+            lcd_set_cursor(1, 0);
+            
+            float v = (snapshot.voltaje_rms == ENERGY_INVALID_SENTINEL) ? 0.0 : snapshot.voltaje_rms;
+            const char* estado_str = snapshot.rele_estado ? "ON " : "OFF";
+            
+            if (!snapshot.rele_estado && snapshot.t_restante_s > 0) {
+                 snprintf(linea_buff, sizeof(linea_buff), "V:%.0f Wait:%ds  ", v, snapshot.t_restante_s);
+            } else {
+                 snprintf(linea_buff, sizeof(linea_buff), "V:%.0f %s      ", v, estado_str);
+            }
+            lcd_send_string(linea_buff);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000)); 
+    }
+}
+
 
 // ---------------------------------------------------------------------
 // MAIN APPLICATION
@@ -511,11 +588,12 @@ void app_main(void) {
     ESP_LOGI(TAG, "Iniciando WiFi Portal...");
     wifi_portal_init();
     
-    // --- FIX: ESPERA ACTIVA DE IP ANTES DE ARRANCAR MQTT ---
+    // --- ESPERA ACTIVA DE IP ---
     ESP_LOGI(TAG, "⏳ Esperando conexión WiFi y dirección IP...");
     int retry = 0;
     const int max_retries = 30; // 30 segundos de paciencia
-    
+    bool wifi_conectado = false; 
+
     while (retry < max_retries) {
         esp_netif_ip_info_t ip_info;
         esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
@@ -523,6 +601,7 @@ void app_main(void) {
         if (netif != NULL && esp_netif_get_ip_info(netif, &ip_info) == ESP_OK) {
             if (ip_info.ip.addr != 0) {
                 ESP_LOGI(TAG, "✅ ¡WiFi Conectado! IP: " IPSTR, IP2STR(&ip_info.ip));
+                wifi_conectado = true;
                 break;
             }
         }
@@ -532,16 +611,19 @@ void app_main(void) {
     }
 
     if (retry >= max_retries) {
-        ESP_LOGE(TAG, "❌ Timeout esperando WiFi. Reiniciando para reintentar...");
-        esp_restart();
+        ESP_LOGE(TAG, "❌ Timeout esperando WiFi. Arrancando en modo OFFLINE (Sin MQTT/SNTP).");
     }
-    // -------------------------------------------------------
 
-    // 6. Iniciar MQTT (Ahora seguro porque tenemos red)
-    ESP_LOGI(TAG, "Iniciando Stack MQTT...");
-    mqtt_app_set_rx_callback(mqtt_on_message);
-
-    mqtt_app_start();
+    // 6. Iniciar Servicios Online (Si hay red)
+    if (wifi_conectado) {
+        // A. Hora de Internet (NTP)
+        init_sntp();
+        
+        // B. MQTT
+        ESP_LOGI(TAG, "Iniciando Stack MQTT...");
+        mqtt_app_set_rx_callback(mqtt_on_message);
+        mqtt_app_start();
+    }
 
     // 7. Lanzar Tareas
     xTaskCreate(vTaskFactoryReset, "Task_Reset", 2048, NULL, 1, NULL);
@@ -549,6 +631,9 @@ void app_main(void) {
     xTaskCreatePinnedToCore(vTaskEnergia, "Task_Metrologia", 4096, NULL, 10, NULL, 1);
     xTaskCreatePinnedToCore(vTaskProteccion, "Task_Proteccion", 4096, NULL, 8, NULL, 1);
     xTaskCreatePinnedToCore(vTaskReporte, "Task_Reporte", 4096, NULL, 1, NULL, 0);
+    
+    // NUEVA TAREA LCD (Prioridad baja para no bloquear protección)
+    xTaskCreatePinnedToCore(vTaskDisplay, "Task_Display", 4096, NULL, 1, NULL, 0);
 
     ESP_LOGI(TAG, "=== SISTEMA ARRANCADO Y OPERATIVO ===");
 }
