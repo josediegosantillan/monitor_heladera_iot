@@ -101,7 +101,7 @@ void mqtt_app_start(void) {
     const esp_mqtt_client_config_t mqtt_cfg = {
         .broker = {
             .address = {
-                .uri = "wss://gaddbar.duckdns.org/mqtt", 
+                .uri = "wss://thebaltoteam.com.ar/mqtt", 
                 .port = 443,
             },
             .verification = {
@@ -111,7 +111,7 @@ void mqtt_app_start(void) {
         .credentials = {
             .username = "esp32_heladera",
             .authentication = {
-                .password = "CLAVE_HELADERA",
+                .password = "291289",
             },
         },
         .session = {
